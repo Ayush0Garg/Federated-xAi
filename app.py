@@ -431,24 +431,57 @@ class FederatedAggregator:
         }
 
 
-print("Initializing Federated XAI System...")
-aggregator = FederatedAggregator()
-print("✓ All nodes trained and ready")
+# ── LAZY STARTUP — initializes on first request if needed ────────────────
+_aggregator = None
+_init_error = None
+
+def get_aggregator():
+    global _aggregator, _init_error
+    if _aggregator is not None:
+        return _aggregator
+    if _init_error is not None:
+        raise RuntimeError(f"Init failed: {_init_error}")
+    try:
+        import logging
+        logging.getLogger(__name__).info("Starting FederatedAggregator init...")
+        _aggregator = FederatedAggregator()
+        logging.getLogger(__name__).info("FederatedAggregator ready")
+        return _aggregator
+    except Exception as e:
+        import traceback
+        _init_error = traceback.format_exc()
+        logging.getLogger(__name__).error(f"FederatedAggregator init failed:\n{_init_error}")
+        raise
+
+# Attempt eager init (so Render logs show the error immediately)
+try:
+    print("Initializing Federated XAI System...")
+    _aggregator = FederatedAggregator()
+    print("✓ All nodes trained and ready")
+except Exception as _e:
+    import traceback as _tb
+    print(f"⚠ Init error (will retry on first request): {_e}")
+    print(_tb.format_exc())
+
+# Alias used by all route handlers
+aggregator = None  # routes call get_aggregator() instead
+
+
 
 # ── ROUTES ───────────────────────────────────────────────────────────────
 @app.route('/api/status')
 def get_status():
-    return jsonify({"status":"online","nodes":len(aggregator.nodes),"model_ready":aggregator.is_trained,
-                    "hospitals":HOSPITALS,"training_rounds":len(aggregator.round_history)})
+    return jsonify({"status":"online","nodes":len(get_aggregator().nodes),"model_ready":get_aggregator().is_trained,
+                    "hospitals":HOSPITALS,"training_rounds":len(get_aggregator().round_history)})
 
 @app.route('/api/hospitals')
 def get_hospitals():
-    return jsonify({hid:{**info,**aggregator.nodes[hid].stats()} for hid,info in HOSPITALS.items()})
+    return jsonify({hid:{**info,**get_aggregator().nodes[hid].stats()} for hid,info in HOSPITALS.items()})
 
 @app.route('/api/training-history')
 def get_training_history():
-    return jsonify({"rounds":aggregator.round_history,"total_rounds":len(aggregator.round_history),
-                    "final_global_accuracy":round(aggregator.round_history[-1]["global_acc"]*100,1)})
+    return jsonify({"rounds":get_aggregator().round_history,"total_rounds":len(get_aggregator().round_history),
+                    "final_global_accuracy":round(get_aggregator().round_history[-1]["global_acc"]*100,1)})
 
 @app.route('/api/aggregation-log')
 def get_log():
@@ -471,7 +504,7 @@ def predict():
     if not features or len(features)!=30:
         return jsonify({"error":"Need 30 features"}), 400
     try:
-        result = aggregator.predict_with_xai(features)
+        result = get_aggregator().predict_with_xai(features)
         log_event("predict","global",f"Prediction: {result['global_prediction']['label']} ({result['global_prediction']['confidence']}%)")
         return jsonify(result)
     except Exception as e:
@@ -479,19 +512,19 @@ def predict():
 
 @app.route('/api/federated-round', methods=['POST'])
 def sim_round():
-    last = aggregator.round_history[-1]
+    last = get_aggregator().round_history[-1]
     rec  = {"round":last["round"]+1,
             "hosp_1_acc":min(0.99,last["hosp_1_acc"]+random.uniform(0.001,0.005)),
             "hosp_2_acc":min(0.99,last["hosp_2_acc"]+random.uniform(0.001,0.005)),
             "hosp_3_acc":min(0.99,last["hosp_3_acc"]+random.uniform(0.001,0.005)),
             "global_acc":min(0.99,last["global_acc"]+random.uniform(0.002,0.007)),
             "communication_cost":max(0.02,last["communication_cost"]*0.85)}
-    aggregator.round_history.append(rec)
+    get_aggregator().round_history.append(rec)
     return jsonify(rec)
 
 @app.route('/api/upload-data/<hid>', methods=['POST'])
 def upload_data(hid):
-    if hid not in aggregator.nodes: return jsonify({"error":"Unknown hospital"}), 404
+    if hid not in get_aggregator().nodes: return jsonify({"error":"Unknown hospital"}), 404
     if 'file' not in request.files: return jsonify({"error":"No file"}), 400
     try:
         df = pd.read_csv(io.StringIO(request.files['file'].read().decode('utf-8')))
@@ -501,7 +534,7 @@ def upload_data(hid):
         if data.shape[1]!=30: return jsonify({"error":f"Need 30 feature cols, got {data.shape[1]}"}), 400
         if len(np.unique(labels))<2: return jsonify({"error":"Need both classes"}), 400
         if len(data)<6: return jsonify({"error":"Need ≥6 rows"}), 400
-        node = aggregator.nodes[hid]
+        node = get_aggregator().nodes[hid]
         node.retrain(data, labels)
         log_event("upload_data",hid,f"Uploaded {len(data)} rows → acc={node.accuracy_history[-1]*100:.1f}%")
         return jsonify({"success":True,"rows_loaded":len(data),"local_accuracy":round(node.accuracy_history[-1]*100,1),
@@ -511,7 +544,7 @@ def upload_data(hid):
 
 @app.route('/api/upload-weights/<hid>', methods=['POST'])
 def upload_weights(hid):
-    if hid not in aggregator.nodes: return jsonify({"error":"Unknown hospital"}), 404
+    if hid not in get_aggregator().nodes: return jsonify({"error":"Unknown hospital"}), 404
     if 'file' not in request.files: return jsonify({"error":"No file"}), 400
     try:
         payload = json.loads(request.files['file'].read().decode('utf-8'))
@@ -520,7 +553,7 @@ def upload_weights(hid):
         weights = [float(w) for w in weights]
         t = sum(weights)
         if t>0: weights = [w/t for w in weights]
-        aggregator.nodes[hid].set_weights(weights)
+        get_aggregator().nodes[hid].set_weights(weights)
         top = FEATURE_NAMES[int(np.argmax(weights))]
         log_event("upload_weights",hid,f"Weights injected — top: {top}")
         return jsonify({"success":True,"weights_received":30,"top_feature":top,
@@ -530,8 +563,8 @@ def upload_weights(hid):
 
 @app.route('/api/retrain/<hid>', methods=['POST'])
 def retrain(hid):
-    if hid not in aggregator.nodes: return jsonify({"error":"Unknown hospital"}), 404
-    node = aggregator.nodes[hid]
+    if hid not in get_aggregator().nodes: return jsonify({"error":"Unknown hospital"}), 404
+    node = get_aggregator().nodes[hid]
     node.retrain()
     log_event("retrain",hid,f"Retrained — acc={node.accuracy_history[-1]*100:.1f}%")
     return jsonify({"success":True,"local_accuracy":round(node.accuracy_history[-1]*100,1),
@@ -541,7 +574,7 @@ def retrain(hid):
 @app.route('/api/aggregate', methods=['POST'])
 def aggregate():
     try:
-        rec = aggregator.aggregate()
+        rec = get_aggregator().aggregate()
         return jsonify({"success":True,"round":rec["round"],
                         "global_accuracy":round(rec["global_acc"]*100,1),
                         "node_accuracies":{"hosp_1":round(rec["hosp_1_acc"]*100,1),
@@ -552,16 +585,16 @@ def aggregate():
 
 @app.route('/api/export-weights/<hid>')
 def export_weights(hid):
-    if hid not in aggregator.nodes: return jsonify({"error":"Unknown hospital"}), 404
-    node = aggregator.nodes[hid]
+    if hid not in get_aggregator().nodes: return jsonify({"error":"Unknown hospital"}), 404
+    node = get_aggregator().nodes[hid]
     return jsonify({"hospital_id":hid,"hospital_name":HOSPITALS[hid]["name"],
                     "weights":node.get_model_weights(),"feature_names":FEATURE_NAMES,
                     "exported_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())})
 
 @app.route('/api/export-sample-csv/<hid>')
 def export_csv(hid):
-    if hid not in aggregator.nodes: return jsonify({"error":"Unknown hospital"}), 404
-    node = aggregator.nodes[hid]
+    if hid not in get_aggregator().nodes: return jsonify({"error":"Unknown hospital"}), 404
+    node = get_aggregator().nodes[hid]
     rows = [{FEATURE_NAMES[j]:round(float(row[j]),6) for j in range(30)} | {"label":int(lbl)}
             for row,lbl in zip(node.data,node.labels)]
     csv = pd.DataFrame(rows).to_csv(index=False)
@@ -569,27 +602,52 @@ def export_csv(hid):
                     headers={"Content-Disposition":f"attachment;filename={hid}_data.csv"})
 
 
-# ── FRONTEND SERVING (must come LAST, after all /api/* routes) ────────────
-import os as _os
+
+# ── LOGGING ───────────────────────────────────────────────────────────────
+import logging, os as _os
 from flask import send_from_directory as _sfd
 
-_FRONTEND = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'frontend')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
 
+# ── FRONTEND PATH — works locally and on Render ───────────────────────────
+_HERE     = _os.path.dirname(_os.path.abspath(__file__))
+# Try sibling frontend/ dir first, then same dir (if user puts index.html next to app.py)
+_FRONTEND = None
+for _candidate in [
+    _os.path.join(_HERE, '..', 'frontend'),
+    _os.path.join(_HERE, 'frontend'),
+    _HERE,
+]:
+    if _os.path.exists(_os.path.join(_candidate, 'index.html')):
+        _FRONTEND = _os.path.realpath(_candidate)
+        break
+
+logger.info(f"Frontend path resolved to: {_FRONTEND}")
+logger.info(f"Working directory: {_os.getcwd()}")
+
+# ── FRONTEND SERVING (must come LAST, after all /api/* routes) ────────────
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_frontend(path):
-    # Never intercept /api/* — those are handled above
     if path.startswith('api/'):
         return jsonify({"error": "Not found"}), 404
-    target = path if path and _os.path.exists(_os.path.join(_FRONTEND, path)) else 'index.html'
+    if _FRONTEND is None:
+        return jsonify({"error": "Frontend not found — check deployment structure"}), 500
+    target = path if (path and _os.path.exists(_os.path.join(_FRONTEND, path))) else 'index.html'
     return _sfd(_FRONTEND, target)
 
-# ── JSON error handlers so Flask never returns HTML on API errors ─────────
+# ── JSON ERROR HANDLERS ───────────────────────────────────────────────────
 @app.errorhandler(404)
 def not_found(e):
     if request.path.startswith('/api/'):
         return jsonify({"error": "Endpoint not found"}), 404
-    return _sfd(_FRONTEND, 'index.html')
+    if _FRONTEND:
+        return _sfd(_FRONTEND, 'index.html')
+    return jsonify({"error": "Not found"}), 404
 
 @app.errorhandler(405)
 def method_not_allowed(e):
@@ -597,7 +655,27 @@ def method_not_allowed(e):
 
 @app.errorhandler(500)
 def internal_error(e):
-    return jsonify({"error": str(e)}), 500
+    # Log the real traceback to Render's log stream
+    logger.exception("Internal server error")
+    return jsonify({"error": str(e), "type": type(e).__name__}), 500
+
+@app.errorhandler(Exception)
+def unhandled(e):
+    logger.exception("Unhandled exception")
+    return jsonify({"error": str(e), "type": type(e).__name__}), 500
+
+# ── HEALTH / DEBUG ENDPOINT ───────────────────────────────────────────────
+@app.route('/api/health')
+def health():
+    import sys
+    return jsonify({
+        "status":    "ok",
+        "python":    sys.version,
+        "cwd":       _os.getcwd(),
+        "frontend":  _FRONTEND,
+        "nodes":     len(get_aggregator().nodes) if get_aggregator().is_trained else 0,
+        "trained":   get_aggregator().is_trained,
+    })
 
 if __name__ == '__main__':
     app.run(debug=False, port=5050, host='0.0.0.0')

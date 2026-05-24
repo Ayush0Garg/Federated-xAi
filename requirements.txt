@@ -1,0 +1,8 @@
+flask==3.0.3
+flask-cors==4.0.1
+scikit-learn==1.5.2
+numpy==1.26.4
+pandas==2.2.3
+shap==0.46.0
+lime==0.2.0.1
+gunicorn==22.0.0

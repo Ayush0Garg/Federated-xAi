@@ -426,6 +426,10 @@ let hospitals = {};
 
 // ── INIT ─────────────────────────────────────────────────────────────────
 window.onload = async () => {
+  // Show a banner if on Render (not localhost) — warns about cold start
+  if(window.location.hostname !== 'localhost') {
+    toast('Connecting to server — may take 30s on first load (Render free tier)', 'info');
+  }
   buildFeatGrid();
   await Promise.all([loadStatus(), loadHospitals(), loadTraining()]);
   loadLog();
@@ -450,9 +454,11 @@ async function loadStatus() {
     document.getElementById('sTxt').textContent='ONLINE';
     document.getElementById('sNodes').textContent=`${d.nodes} NODES ACTIVE`;
     document.getElementById('sRounds').textContent=`${d.training_rounds} ROUNDS`;
-  } catch {
+  } catch(e) {
     document.getElementById('sDot').className='dot red';
     document.getElementById('sTxt').textContent='OFFLINE';
+    console.error('Status check failed:', e.message);
+    toast(e.message, 'error');
   }
 }
 
@@ -737,7 +743,7 @@ async function runRound() {
     trainData.global.push(+(d.global_acc*100).toFixed(1));
     renderChart();
     document.getElementById('sRounds').textContent=`${trainData.rounds.length} ROUNDS`;
-  } catch(e) { toast('Backend offline','error'); }
+  } catch(e) { toast(e.message, 'error'); }
   btn.disabled=false; btn.textContent='▶ RUN ROUND';
 }
 window.addEventListener('resize', ()=>{ if(trainData.rounds.length) renderChart(); });
@@ -759,7 +765,7 @@ async function loadSample(type) {
     tag.style.display='block';
     const col = d.true_label==='Malignant'?'var(--warn)':'var(--accent3)';
     tag.innerHTML=`Patient: <span style="color:var(--accent)">${d.patient_id}</span> &nbsp;·&nbsp; True: <span style="color:${col}">${d.true_label}</span>`;
-  } catch { toast('Backend offline','error'); }
+  } catch(e) { toast(e.message, 'error'); }
 }
 
 async function runPredict() {
@@ -774,7 +780,8 @@ async function runPredict() {
     renderShapBars(predResult, curShapTab);
     document.getElementById('xaiCard').style.display='block';
   } catch(e) {
-    document.getElementById('resultsContent').innerHTML=`<div class="empty"><p style="color:var(--warn)">Backend offline. Start the Flask server.</p></div>`;
+    document.getElementById('resultsContent').innerHTML=`<div class="empty"><p style="color:var(--warn)">${e.message}</p></div>`;
+    toast(e.message, 'error');
   }
   btn.disabled=false; btn.textContent='🔬 ANALYZE WITH FEDXAI';
 }
@@ -848,7 +855,7 @@ async function loadLog() {
             <span class="log-msg">${e.message}</span>
           </div>`).join('')}</div>`;
     renderLogNodeCards();
-  } catch { document.getElementById('logContent').innerHTML='<div class="empty"><p style="color:var(--warn)">Backend offline</p></div>'; }
+  } catch(e) { document.getElementById('logContent').innerHTML=`<div class="empty"><p style="color:var(--warn)">${e.message}</p></div>`; }
 }
 
 function renderLogNodeCards() {
@@ -879,7 +886,7 @@ async function downloadCSV(hid) {
     const a = document.createElement('a'); a.href=url; a.download=`${hid}_data.csv`; a.click();
     URL.revokeObjectURL(url);
     toast(`${HOSP_NAMES[hid]} CSV downloaded`, 'info');
-  } catch { toast('Download failed — is the backend running?', 'error'); }
+  } catch(e) { toast(e.message, 'error'); }
 }
 
 async function downloadWeights(hid) {
@@ -890,23 +897,45 @@ async function downloadWeights(hid) {
     const a = document.createElement('a'); a.href=url; a.download=`${hid}_weights.json`; a.click();
     URL.revokeObjectURL(url);
     toast(`${HOSP_NAMES[hid]} weights downloaded`, 'info');
-  } catch { toast('Download failed', 'error'); }
+  } catch(e) { toast(e.message, 'error'); }
 }
 
 // ── API HELPERS ───────────────────────────────────────────────────────────
-async function api(path, method='GET', body=null) {
-  const opts = {method, headers:{'Content-Type':'application/json'}};
-  if(body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${API}${path}`, opts);
-  const d = await res.json();
-  if(!res.ok) throw new Error(d.error||`HTTP ${res.status}`);
-  return d;
+async function api(path, method='GET', body=null, timeoutMs=25000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const opts = {method, headers:{'Content-Type':'application/json'}, signal: ctrl.signal};
+    if(body) opts.body = JSON.stringify(body);
+    const res = await fetch(`${API}${path}`, opts);
+    clearTimeout(timer);
+    let d;
+    try { d = await res.json(); } catch { throw new Error(`Server returned non-JSON (status ${res.status})`); }
+    if(!res.ok) throw new Error(d.error || `Server error ${res.status}`);
+    return d;
+  } catch(e) {
+    clearTimeout(timer);
+    if(e.name === 'AbortError') throw new Error('Request timed out — server may be waking up, try again in 10s');
+    if(e.message.includes('fetch') || e.message.includes('NetworkError') || e.message.includes('Failed to fetch'))
+      throw new Error('Cannot reach server — check it is running on ' + API);
+    throw e;
+  }
 }
-async function apiFD(path, fd) {
-  const res = await fetch(`${API}${path}`, {method:'POST', body:fd});
-  const d = await res.json();
-  if(!res.ok) throw new Error(d.error||`HTTP ${res.status}`);
-  return d;
+async function apiFD(path, fd, timeoutMs=30000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${API}${path}`, {method:'POST', body:fd, signal: ctrl.signal});
+    clearTimeout(timer);
+    let d;
+    try { d = await res.json(); } catch { throw new Error(`Server returned non-JSON (status ${res.status})`); }
+    if(!res.ok) throw new Error(d.error || `Server error ${res.status}`);
+    return d;
+  } catch(e) {
+    clearTimeout(timer);
+    if(e.name === 'AbortError') throw new Error('Upload timed out — try again');
+    throw e;
+  }
 }
 
 // ── TOAST ─────────────────────────────────────────────────────────────────
